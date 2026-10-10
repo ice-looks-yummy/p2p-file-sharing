@@ -1,10 +1,5 @@
 p2p
-p2p_working_backup.c
-p2p_complete_reference.c
-A/
-B/
-C/
-D/
-downloads/
-shared/
-
+*.o
+*.exe
+data_*/
+*.meta
