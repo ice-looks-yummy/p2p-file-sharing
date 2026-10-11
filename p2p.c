@@ -1221,6 +1221,122 @@ int run_seed(char *id, char *port_text, char *tracker_text, char *file)
     return 0;
 }
 
+/*
+ * Reconstruct the original file from verified pieces.
+ * The output stays inside this peer's data directory.
+ * A temporary file is renamed only after size and whole-file hash checks pass.
+ */
+int reconstruct_file(void)
+{
+    char final_path[1024];
+    char temp_path[1024];
+
+    if (strchr(info.filename, '/') != NULL ||
+        strcmp(info.filename, ".") == 0 ||
+        strcmp(info.filename, "..") == 0) {
+        fprintf(stderr, "Invalid filename in metadata\n");
+        return -1;
+    }
+
+    int a = snprintf(final_path, sizeof(final_path), "%s/%s",
+                     data_dir, info.filename);
+    int b = snprintf(temp_path, sizeof(temp_path), "%s/%s.reconstructing",
+                     data_dir, info.filename);
+
+    if (a < 0 || (size_t)a >= sizeof(final_path) ||
+        b < 0 || (size_t)b >= sizeof(temp_path)) {
+        fprintf(stderr, "Reconstructed file path is too long\n");
+        return -1;
+    }
+
+    unsigned char *buffer = malloc((size_t)info.piece_size + 1);
+    if (!buffer) {
+        perror("malloc");
+        return -1;
+    }
+
+    FILE *out = fopen(temp_path, "wb");
+    if (!out) {
+        perror(temp_path);
+        free(buffer);
+        return -1;
+    }
+
+    int failed = 0;
+
+    for (int i = 0; i < info.piece_count; i++) {
+        char path[512];
+        piece_path(path, i);
+
+        FILE *piece_file = fopen(path, "rb");
+        if (!piece_file) {
+            fprintf(stderr, "Cannot open piece %d: %s\n", i, path);
+            failed = 1;
+            break;
+        }
+
+        int length = piece_length(i);
+        size_t got = fread(buffer, 1, (size_t)length + 1, piece_file);
+        int read_error = ferror(piece_file);
+        fclose(piece_file);
+
+        if (read_error || got != (size_t)length ||
+            hash_data(buffer, length) != info.piece_hash[i]) {
+            fprintf(stderr, "Piece %d failed reconstruction verification\n", i);
+            failed = 1;
+            break;
+        }
+
+        if (fwrite(buffer, 1, (size_t)length, out) != (size_t)length) {
+            perror("writing reconstructed file");
+            failed = 1;
+            break;
+        }
+    }
+
+    if (fclose(out) != 0) {
+        perror("closing reconstructed file");
+        failed = 1;
+    }
+
+    free(buffer);
+
+    if (failed) {
+        remove(temp_path);
+        return -1;
+    }
+
+    FILE *check = fopen(temp_path, "rb");
+    if (!check) {
+        perror(temp_path);
+        remove(temp_path);
+        return -1;
+    }
+
+    int size_ok = fseek(check, 0, SEEK_END) == 0;
+    long long actual_size = size_ok ? (long long)ftell(check) : -1;
+    int hash_ok = fseek(check, 0, SEEK_SET) == 0;
+    uint64_t actual_hash = hash_ok ? hash_file(check) : 0;
+    int check_error = ferror(check);
+    fclose(check);
+
+    if (!size_ok || !hash_ok || check_error ||
+        actual_size != info.size || actual_hash != info.file_hash) {
+        fprintf(stderr, "Reconstructed file failed size or hash verification\n");
+        remove(temp_path);
+        return -1;
+    }
+
+    if (rename(temp_path, final_path) != 0) {
+        perror("renaming reconstructed file");
+        remove(temp_path);
+        return -1;
+    }
+
+    printf("Reconstructed and verified file: %s\n", final_path);
+    return 0;
+}
+
 int run_download(char *id, char *port_text, char *tracker_text,
                  char *meta, int exit_when_done)
 {
@@ -1290,9 +1406,13 @@ int run_download(char *id, char *port_text, char *tracker_text,
         return 2;
     }
 
-    printf("\nDownload complete: all %d piece(s) verified and stored in %s/\n",
-           info.piece_count, data_dir);
-    printf("Note: reassembling the pieces into the final file is not part of this stage.\n");
+    if (reconstruct_file() != 0) {
+        fprintf(stderr, "Download pieces are present, but reconstruction failed.\n");
+        return 3;
+    }
+
+    printf("\nDownload complete: %d piece(s) verified and reconstructed in %s/%s\n",
+           info.piece_count, data_dir, info.filename);
 
     if (exit_when_done)
         return 0;
