@@ -1045,10 +1045,62 @@ int load_existing_pieces(void)
    the first reachable peer that advertises it. Returns the number of pieces
    that are still missing (0 = complete).
 */
+#define DOWNLOAD_WORKERS 4
+
+typedef struct {
+    Source *sources;
+    int source_count;
+    int *failures;
+} WorkerContext;
+
+static void *download_worker(void *arg)
+{
+    WorkerContext *ctx = arg;
+
+    for (int piece = 0; piece < info.piece_count; piece++) {
+        pthread_mutex_lock(&state_mutex);
+        if (get_bit(have, piece) || get_bit(busy, piece)) {
+            pthread_mutex_unlock(&state_mutex);
+            continue;
+        }
+        set_bit(busy, piece);
+        pthread_mutex_unlock(&state_mutex);
+
+        for (int s = 0; s < ctx->source_count; s++) {
+            pthread_mutex_lock(&state_mutex);
+            int exhausted = ctx->failures[s] >= MAX_FAILS;
+            pthread_mutex_unlock(&state_mutex);
+
+            if (exhausted || !get_bit(ctx->sources[s].bits, piece))
+                continue;
+
+            printf("Requesting piece %d from %s (port %d)\n",
+                   piece, ctx->sources[s].peer.id,
+                   ctx->sources[s].peer.port);
+
+            if (download_piece(&ctx->sources[s].peer, piece) == OK) {
+                printf("  piece %d verified and stored (%d/%d pieces held)\n",
+                       piece, count_have(), info.piece_count);
+                break;
+            }
+
+            pthread_mutex_lock(&state_mutex);
+            ctx->failures[s]++;
+            pthread_mutex_unlock(&state_mutex);
+        }
+
+        pthread_mutex_lock(&state_mutex);
+        clear_bit(busy, piece);
+        pthread_mutex_unlock(&state_mutex);
+    }
+
+    return NULL;
+}
+
 int download_all(void)
 {
     static Source sources[MAX_SOURCES];
-    int failures[MAX_SOURCES];
+    int failures[MAX_SOURCES] = {0};
     Peer peers[MAX_PEERS];
 
     for (int round = 1; round <= MAX_ROUNDS; round++) {
@@ -1056,12 +1108,10 @@ int download_all(void)
             return 0;
 
         memset(peers, 0, sizeof(peers));
-
         int found = get_peers(peers);
         int count = 0;
 
         for (int i = 0; i < found && count < MAX_SOURCES; i++) {
-            /* Never download from ourselves. */
             if (peers[i].port == peer_port ||
                 strcmp(peers[i].id, peer_id) == 0)
                 continue;
@@ -1081,33 +1131,26 @@ int download_all(void)
         printf("Round %d/%d: tracker listed %d peer(s), %d reachable\n",
                round, MAX_ROUNDS, found, count);
 
-        for (int piece = 0; piece < info.piece_count; piece++) {
-            if (has_piece(piece))
-                continue;
+        pthread_mutex_lock(&state_mutex);
+        memset(busy, 0, sizeof(busy));
+        pthread_mutex_unlock(&state_mutex);
 
-            int ok = 0;
-            int tried = 0;
+        WorkerContext ctx = { sources, count, failures };
+        pthread_t workers[DOWNLOAD_WORKERS];
+        int started = 0;
 
-            for (int s = 0; s < count && !ok; s++) {
-                if (!get_bit(sources[s].bits, piece) || failures[s] >= MAX_FAILS)
-                    continue;
+        for (int i = 0; i < DOWNLOAD_WORKERS; i++) {
+            if (pthread_create(&workers[i], NULL, download_worker, &ctx) == 0)
+                started++;
+            else
+                break;
+        }
 
-                tried++;
-
-                printf("Requesting piece %d from %s (port %d)\n",
-                       piece, sources[s].peer.id, sources[s].peer.port);
-
-                if (download_piece(&sources[s].peer, piece) == OK) {
-                    printf("  piece %d verified and stored (%d/%d pieces held)\n",
-                           piece, count_have(), info.piece_count);
-                    ok = 1;
-                } else {
-                    failures[s]++;
-                }
-            }
-
-            if (!ok && tried == 0)
-                printf("No reachable peer currently offers piece %d\n", piece);
+        if (started == 0) {
+            download_worker(&ctx);
+        } else {
+            for (int i = 0; i < started; i++)
+                pthread_join(workers[i], NULL);
         }
 
         if (count_have() == info.piece_count)
