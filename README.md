@@ -92,7 +92,7 @@ FNV-1a detects accidental corruption but is not a cryptographic hash and does no
 
 ## Limitations
 
-- Piece downloads are sequential in the current implementation.
+- Downloads use up to 4 worker threads to fetch missing pieces in parallel.
 - Peers must be able to connect over the configured TCP ports.
 - This is an educational project, not a production-hardened file-sharing service.
 
@@ -101,5 +101,5 @@ FNV-1a detects accidental corruption but is not a cryptographic hash and does no
 - Single-piece transfer between peers
 - Piece integrity verification
 - File reconstruction and comparison using `cmp`
-- Two-piece transfer using a 512 KiB file
+- Two-piece parallel download using a 512 KiB file
 - Comparison of the original and reconstructed multi-piece files
